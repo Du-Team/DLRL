@@ -22,7 +22,6 @@ DLRL/
 ├── config.yaml
 ├── config1.yaml
 ├── config2.yaml
-├── requirements.txt
 └── train.py
 ```
 ## Requirements
