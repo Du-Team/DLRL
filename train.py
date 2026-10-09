@@ -122,22 +122,6 @@ def build_pretrain_signature(args):
     }
 
 
-def validate_augsburg_pretrain_checkpoint(checkpoint, expected_signature, path):
-    """Reject stale Augsburg checkpoints after a three-view pipeline change."""
-    if not isinstance(checkpoint, dict):
-        raise ValueError(
-            "Augsburg pretrain checkpoint has no metadata: {}. "
-            "Use a new checkpoint path and retrain.".format(path)
-        )
-    actual_signature = checkpoint.get("pretrain_signature")
-    if actual_signature != expected_signature:
-        raise ValueError(
-            "Augsburg pretrain checkpoint signature mismatch: {}. "
-            "Expected {!r}, found {!r}. Use a new checkpoint path and retrain."
-            .format(path, expected_signature, actual_signature)
-        )
-
-
 def configure_cuda_acceleration(args):
     """Configure optional CUDA math acceleration without changing model logic."""
     amp_dtype_name = str(getattr(args, "amp_dtype", "float16")).strip().lower()
@@ -444,7 +428,8 @@ def update_ema_model(ema_model, model, momentum):
 
 
 def train(model, loss_op, train_loader, optimizer, ema_model=None, ema_momentum=0.995,
-          amp_enabled=False, amp_dtype=torch.float16, amp_scaler=None):
+          amp_enabled=False, amp_dtype=torch.float16, amp_scaler=None,
+          preserve_cooling_centers=True):
     model.train()
     loss_epoch = torch.zeros((), device=DEVICE)
     relation_totals = {}
@@ -498,7 +483,7 @@ def train(model, loss_op, train_loader, optimizer, ema_model=None, ema_momentum=
             amp_scaler.scale(loss_).backward()
         center_grad = model.clustering_head.cluster_centers.grad
         inactive_center_snapshot = None
-        if inactive_center_rows is not None:
+        if inactive_center_rows is not None and preserve_cooling_centers:
             inactive_center_snapshot = (
                 model.clustering_head.cluster_centers.detach()[
                     inactive_center_rows
@@ -511,7 +496,7 @@ def train(model, loss_op, train_loader, optimizer, ema_model=None, ema_momentum=
         else:
             amp_scaler.step(optimizer)
             amp_scaler.update()
-        if inactive_center_rows is not None:
+        if inactive_center_rows is not None and preserve_cooling_centers:
             # Adam's weight decay and momentum can move a row even after its
             # data gradient is zeroed. Restore cooling centers exactly and
             # clear only their optimizer moments.
@@ -949,7 +934,8 @@ def cluster_repair_succeeded(
 def repair_cluster_centers_with_rollback(
         model, dataset_train, cluster_counts, min_samples, device, optimizer,
         batch_size=512, workers=2, candidate_pool_size=4096,
-        ema_model=None, repair_strategy="split_largest", prefetch_factor=4):
+        ema_model=None, repair_strategy="split_largest", prefetch_factor=4,
+        rollback_on_error=False):
     """Route legacy repairs or run density-aware repair with rollback."""
     repair_strategy = str(repair_strategy).strip().lower()
     centers = model.clustering_head.cluster_centers
@@ -985,12 +971,31 @@ def repair_cluster_centers_with_rollback(
 
     center_snapshot = centers.detach().clone()
     previous_counts = cluster_counts.detach().cpu().clone()
-    repair = reseed_undercovered_cluster_centers(
-        model, dataset_train, cluster_counts, min_samples, device,
-        batch_size=batch_size, workers=workers,
-        candidate_pool_size=candidate_pool_size,
-        prefetch_factor=prefetch_factor,
-    )
+    try:
+        repair = reseed_undercovered_cluster_centers(
+            model, dataset_train, cluster_counts, min_samples, device,
+            batch_size=batch_size, workers=workers,
+            candidate_pool_size=candidate_pool_size,
+            prefetch_factor=prefetch_factor,
+        )
+    except Exception as error:
+        if not rollback_on_error:
+            raise
+        centers.copy_(center_snapshot)
+        restored_freq, restored_counts = compute_global_cluster_stats(
+            model, dataset_train, device,
+            batch_size=batch_size, workers=workers,
+            prefetch_factor=prefetch_factor,
+        )
+        return restored_freq, restored_counts, {
+            "strategy": "split_largest",
+            "repaired_clusters": [],
+            "donor_clusters": [],
+            "touched_clusters": [],
+            "rejection_reasons": [
+                "repair_exception:{}:{}".format(type(error).__name__, error)
+            ],
+        }, False
     repair["strategy"] = "split_largest"
     repaired_freq, repaired_counts = compute_global_cluster_stats(
         model, dataset_train, device,
@@ -1264,16 +1269,57 @@ if __name__ == "__main__":
     shared_pretrain_checkpoint = str(
         getattr(args, "shared_pretrain_checkpoint", "")
     ).strip()
-    pretrain_signature = build_pretrain_signature(args)
+    is_augsburg = args.dataset == "Augsburg"
+    if is_augsburg:
+        pretrain_checkpoint = (
+            str(getattr(args, "pretrain_checkpoint_path", "")).strip()
+            or shared_pretrain_checkpoint
+            or os.path.join(pretrain_path, "pretrain_checkpoint.tar")
+        )
+        reuse_pretrain = bool(getattr(args, "reuse_pretrain_checkpoint", True))
+        save_pretrain = bool(getattr(args, "save_pretrain_checkpoint", True))
+        pretrain_metadata = {
+            "dataset": str(args.dataset),
+            "n_modality": int(dataset_train.n_modality),
+            "in_channels": [int(c) for c in dataset_train.in_channels],
+            "image_size": int(args.image_size),
+            "dim_emebeding": int(args.dim_emebeding),
+            "projection_dim": int(getattr(args, "projection_dim", 128)),
+        }
+    else:
+        pretrain_checkpoint = shared_pretrain_checkpoint
+        reuse_pretrain = True
+        save_pretrain = bool(shared_pretrain_checkpoint)
+        pretrain_signature = build_pretrain_signature(args)
     print('Learning rates: pretrain_lr={:.6g}, joint_lr={:.6g}'.format(pretrain_lr, joint_lr))
-    if shared_pretrain_checkpoint and os.path.exists(shared_pretrain_checkpoint):
-        checkpoint = torch.load(shared_pretrain_checkpoint, map_location=DEVICE)
-        if args.dataset == "Augsburg":
-            validate_augsburg_pretrain_checkpoint(
-                checkpoint, pretrain_signature, shared_pretrain_checkpoint
-            )
+    if is_augsburg:
+        print('Pretrain checkpoint: path={} reuse={} save={}'.format(
+            pretrain_checkpoint, reuse_pretrain, save_pretrain))
+    if reuse_pretrain and pretrain_checkpoint and os.path.exists(pretrain_checkpoint):
+        checkpoint = torch.load(pretrain_checkpoint, map_location=DEVICE)
+        if is_augsburg:
+            if not isinstance(checkpoint, dict):
+                raise ValueError("Pretrain checkpoint must be a state dictionary")
+            actual_metadata = checkpoint.get("pretrain_metadata")
+            if actual_metadata is None:
+                print("WARNING: pretrain checkpoint has no compatibility metadata")
+            else:
+                mismatches = {
+                    key: (actual_metadata.get(key), expected)
+                    for key, expected in pretrain_metadata.items()
+                    if actual_metadata.get(key) != expected
+                }
+                if mismatches:
+                    raise ValueError(
+                        "Pretrain checkpoint is incompatible with the current run: "
+                        "{} {}".format(pretrain_checkpoint, mismatches)
+                    )
         model.load_state_dict(checkpoint["net"] if "net" in checkpoint else checkpoint)
-        print('Loaded shared pretrain checkpoint: {}'.format(shared_pretrain_checkpoint))
+        if is_augsburg:
+            print('Loaded pretrain checkpoint; feature pretraining skipped: {}'.format(
+                pretrain_checkpoint))
+        else:
+            print('Loaded shared pretrain checkpoint: {}'.format(pretrain_checkpoint))
     elif pretrain_epochs > 0:
         print('start feature pretraining ...')
         pretrain_optimizer = torch.optim.Adam(
@@ -1295,18 +1341,35 @@ if __name__ == "__main__":
                     np.round(pretrain_monitor["gate_mean"], 4).tolist(),
                     np.round(pretrain_monitor["gate_std"], 4).tolist(),
                 ))
-        if shared_pretrain_checkpoint:
-            checkpoint_dir = os.path.dirname(shared_pretrain_checkpoint)
+        if save_pretrain and pretrain_checkpoint:
+            checkpoint_dir = os.path.dirname(pretrain_checkpoint)
             if checkpoint_dir:
                 os.makedirs(checkpoint_dir, exist_ok=True)
-            torch.save({
+            checkpoint_state = {
                 "net": model.state_dict(),
                 "epoch": pretrain_epochs,
                 "seed": args.seed,
-                "pretrain_signature": pretrain_signature,
-                "note": "Shared label-independent pretrain checkpoint for loss-weight grid search.",
-            }, shared_pretrain_checkpoint)
-            print('Saved shared pretrain checkpoint: {}'.format(shared_pretrain_checkpoint))
+            }
+            if is_augsburg:
+                checkpoint_state["pretrain_metadata"] = pretrain_metadata
+                checkpoint_state["note"] = (
+                    "Label-independent pretrain checkpoint; reusable by compatible runs."
+                )
+            else:
+                checkpoint_state["pretrain_signature"] = pretrain_signature
+                checkpoint_state["note"] = (
+                    "Shared label-independent pretrain checkpoint for loss-weight grid search."
+                )
+            torch.save(checkpoint_state, pretrain_checkpoint)
+            if is_augsburg:
+                print('Saved pretrain checkpoint: {}'.format(pretrain_checkpoint))
+            else:
+                print('Saved shared pretrain checkpoint: {}'.format(pretrain_checkpoint))
+    elif is_augsburg and getattr(args, "require_pretrain_checkpoint_when_skipped", True):
+        raise FileNotFoundError(
+            "Feature pretraining is disabled, but no reusable pretrain "
+            "checkpoint was found at {}".format(pretrain_checkpoint)
+        )
 
     # Stage 2: initialize cluster centers from unaugmented pretrained features.
     print('initializing cluster centers with MiniBatchKMeans ...')
@@ -1624,6 +1687,7 @@ if __name__ == "__main__":
                 ema_model=ema_model,
                 repair_strategy=repair_strategy,
                 prefetch_factor=loader_prefetch_factor,
+                rollback_on_error=is_augsburg,
             )
             repair_attempt += 1
             print('[Epoch {}] Cluster repair strategy={} donors={} targets={} '
@@ -1753,6 +1817,8 @@ if __name__ == "__main__":
             ema_model=ema_model, ema_momentum=ema_momentum,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
             amp_scaler=amp_scaler,
+            preserve_cooling_centers=getattr(
+                args, "preserve_cooling_centers", True),
         )
         for cluster_id in list(cluster_repair_cooldown):
             remaining = cluster_repair_cooldown[cluster_id] - 1
@@ -1847,6 +1913,7 @@ if __name__ == "__main__":
                     ema_model=ema_model,
                     repair_strategy=repair_strategy,
                     prefetch_factor=loader_prefetch_factor,
+                    rollback_on_error=is_augsburg,
                 )
                 post_repair_attempt += 1
                 print('[Epoch {}] Post-train cluster repair strategy={} '

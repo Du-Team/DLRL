@@ -1,0 +1,73 @@
+# MUUFL 实验配置；固定实现参数见 train.py::COMMON_CONFIG_DEFAULTS。
+seed: 42
+workers: 2
+dataset: "MUUFL"
+dataset_root: "/root/data/HSI-Lidar-MUUFL/"
+model_path: "save/MUUFL"
+
+# 训练流程
+batch_size: 256
+joint_train_epoch: 60
+lr_scale: 0.5
+cluster_freeze_epochs: 3
+is_labeled_pixel: false
+is_pretrain: true
+pretrain_epoch: 10
+shared_pretrain_checkpoint: ""
+deterministic_stage_seeding: true
+kmeans_seed: -1  
+joint_seed: -1   
+kmeans_init_sample_size: 8192
+
+# 数据增强与采样
+crop_scale_min: 0.85
+mask_pixel_prob: 0.05
+mask_band_prob: 0.05
+train_sampling_strategy: "all"
+train_max_samples: 0
+
+# 学习率
+pretrain_learning_rate: 0.0001
+joint_learning_rate: 0.00003
+
+# 损失与调度
+contrastive_param: 0.3
+joint_contrastive_weight: 0.005
+joint_contrastive_weight_end: 0.001
+lambda_clu: 0.05
+cluster_lambda_start_ratio: 0.25
+cluster_lambda_ramp_epochs: 5
+lambda_rel_max: 0.3
+dec_frequency_power: 0.75
+balance_coef: 0.0
+center_orthogonal_coef: 0.00001
+small_cluster_protection_weight: 0.0
+small_cluster_floor_factor: 0.5
+small_cluster_min_ratio: 0.0
+init_anchor_weight: 0.1
+ema_anchor_momentum: 0.999
+
+# 可靠性图对比学习
+use_reliability_fusion: true
+use_reliability_contrastive: true
+rac_connection_mode: "hybrid"
+rac_encoder_mix: 0.1
+reliability_graph_sigma: 0.2
+relation_warmup_epochs: 3
+relation_ramp_epochs: 5
+reliability_graph_topk: 16
+
+# 聚类稳定性与高置信聚类
+cluster_coverage_min_samples: 1
+reseed_empty_clusters: true
+reseed_undercovered_clusters: false
+cluster_repair_strategy: "legacy"
+cluster_repair_cooldown_epochs: 0
+post_epoch_cluster_guard: false
+cluster_stats_refresh_every_epoch: true
+use_high_confidence_clu: false
+use_cluster_balanced_clu: false
+preserve_high_confidence_on_incomplete_coverage: false
+clu_reliable_ratio: 0.75
+clu_warmup_epochs: 8
+clu_ramp_epochs: 6
