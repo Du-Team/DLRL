@@ -1,0 +1,68 @@
+# Trento 实验配置；固定实现参数见 train.py::COMMON_CONFIG_DEFAULTS。
+seed: 42
+workers: 2
+dataset: "Trento"
+dataset_root: "HSI-Lidar-Trento/"
+model_path: "save/Trento"
+
+# 训练流程
+batch_size: 256
+joint_train_epoch: 30
+lr_scale: 1
+is_labeled_pixel: false
+is_pretrain: true
+pretrain_epoch: 10
+deterministic_stage_seeding: false
+kmeans_seed: -1  
+joint_seed: -1   
+kmeans_init_sample_size: 8192
+
+# 数据增强与采样
+crop_scale_min: 0.7
+mask_pixel_prob: 0.1
+mask_band_prob: 0.1
+train_sampling_strategy: "all"
+train_max_samples: 0
+
+# 学习率
+pretrain_learning_rate: 0.0001
+joint_learning_rate: 0.00005
+
+# 损失与调度
+contrastive_param: 0.3
+joint_contrastive_weight: 0.005
+joint_contrastive_weight_end: 0.001
+lambda_clu: 0.1
+lambda_rel_max: 0.6
+dec_frequency_power: 1.0
+center_orthogonal_coef: 0.00001
+small_cluster_protection_weight: 0.02
+small_cluster_min_ratio: 0.02
+init_anchor_weight: 0.1
+init_anchor_weight_end: 0.1
+
+# 可靠性图对比学习
+use_reliability_fusion: true
+use_reliability_contrastive: true
+rac_connection_mode: "projection"
+rac_encoder_mix: 0.0
+reliability_graph_sigma: 0.2
+relation_warmup_epochs: 8
+relation_ramp_epochs: 10
+reliability_graph_topk: 16
+
+# 聚类稳定性与高置信聚类
+cluster_coverage_min_samples: 2000
+reseed_undercovered_clusters: true
+cluster_repair_strategy: "legacy"
+cluster_repair_cooldown_epochs: 0
+post_epoch_cluster_guard: true
+cluster_stats_refresh_every_epoch: true
+use_high_confidence_clu: true
+use_cluster_balanced_clu: false
+preserve_high_confidence_on_incomplete_coverage: false
+clu_reliable_ratio: 0.60
+clu_warmup_epochs: 2
+clu_ramp_epochs: 4
+clu_min_confidence: 0.0
+clu_min_samples_per_cluster: 1
